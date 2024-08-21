@@ -1,0 +1,105 @@
+#Image is an ubuntu image with the following installed:
+  # Curl
+  # jq
+  # Wiz cli
+  # Terraform
+  
+image:
+  name: europe-west1-docker.pkg.dev/mateco-interns/wiz-cli/wizcli_image:latest
+  username: '_json_key'
+  password: '$GOOGLE_SERVICE_ACCOUNT_KEY'
+
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: Retrieving display name of the person who made the pull request
+          script:
+            - export BITBUCKET_TRIGGERER_USERNAME=$(curl -X GET -g "https://api.bitbucket.org/2.0/users/${BITBUCKET_STEP_TRIGGERER_UUID}" | jq --raw-output '.display_name')
+            - echo "NAME=\"$BITBUCKET_TRIGGERER_USERNAME\"" >> name.txt
+            - sed -i 's/ /%20/g' name.txt                   
+          artifacts:
+            - name.txt  
+
+      - step:  
+          name: Authenticate to Microsoft Graph API & retrieving email
+          script:
+            - source name.txt
+            - echo -n ${GOOGLE_SERVICE_ACCOUNT_KEY} | docker login -u _json_key --password-stdin http://europe-west1-docker.pkg.dev/mateco-interns/pipes
+            - pipe: docker://europe-west1-docker.pkg.dev/mateco-interns/pipes/microsoftgraph:latest
+              variables:
+                  CLIENT_ID: $CLIENT_ID
+                  CLIENT_SECRET: $CLIENT_SECRET
+                  DISPLAYNAME: $NAME
+               
+      - stage:
+          name: Docker scan
+          steps:
+            - step:
+                name: Scanning docker file
+                script:
+                 - echo -n ${GOOGLE_SERVICE_ACCOUNT_KEY} | docker login -u _json_key --password-stdin http://europe-west1-docker.pkg.dev/mateco-interns/pipes
+                 - pipe: docker://europe-west1-docker.pkg.dev/mateco-interns/pipes/wizcli:latest
+                   variables:
+                    WIZ_CLIENT_ID: $WIZ_CLIENT_ID
+                    WIZ_CLIENT_SECRET: $WIZ_CLIENT_SECRET
+                    POLICY: "Bitbucket_Pipeline_Vulnerabilities"
+                    SCAN_TYPE: "docker"
+                    TAG: $TAG
+                    GOOGLE_SERVICE_ACCOUNT_KEY: $GOOGLE_SERVICE_ACCOUNT_KEY
+      - stage:
+          name: IAC scan
+          steps:
+            - step:
+                name: Making terraform plan json file
+                script:
+                  - export TF_VAR_google_service_account_key=$GOOGLE_SERVICE_ACCOUNT_KEY
+                  - terraform init --backend-config="credentials=$GOOGLE_SERVICE_ACCOUNT_KEY"
+                  - terraform validate
+                  - terraform plan -out plan.tfplan && terraform show -json plan.tfplan > plan.tfplanjson
+                artifacts:
+                  - plan.tfplanjson
+            - step:  
+                name: Executing wiz pipe & sending email if fails
+                script:
+                 - echo -n ${GOOGLE_SERVICE_ACCOUNT_KEY} | docker login -u _json_key --password-stdin http://europe-west1-docker.pkg.dev/mateco-interns/pipes
+                 - JSONFILE=plan.tfplanjson
+                 - pipe: docker://europe-west1-docker.pkg.dev/mateco-interns/pipes/wizcli:latest
+                   variables:
+                    WIZ_CLIENT_ID: $WIZ_CLIENT_ID
+                    WIZ_CLIENT_SECRET: $WIZ_CLIENT_SECRET
+                    POLICY: "Bitbucket_Pipeline_Misconfigurations"
+                    TEAMS_WEBHOOK_URL: $TEAMS_WEBHOOK_URL
+                    CHANNEL_NAME: $CHANNEL_NAME
+                    JSONFILE: $JSONFILE
+                    SCAN_TYPE: "iac"
+                    MAIL: "true"
+                    TEAMS: "true"
+                artifacts:
+                  - /opt/atlassian/pipelines/agent/build/.bitbucket/pipelines/generated/pipeline/pipes/europe-west1-docker.pkg.dev/mateco-interns/pipes/wizcli/mail.html
+                after-script:
+                 - source /opt/atlassian/pipelines/agent/build/.bitbucket/pipelines/generated/pipeline/pipes/europe-west1-docker.pkg.dev/mateco-interns/pipes/microsoftgraph/mail.txt
+                 - pipe: atlassian/email-notify:0.13.1
+                   variables:                    
+                     USERNAME: $SENDGRID
+                     PASSWORD: $APIPASS                   
+                     FROM: 'mateco-interns@mateco.eu'
+                     TO: $MAIL
+                     HOST: 'smtp.sendgrid.net'                     
+                     PORT: 587
+                     SUBJECT: 'BUILD# ${BITBUCKET_BUILD_NUMBER} ${STATUS}: Bitbucket Pipe Notification for ${BITBUCKET_BRANCH}.'
+                     BODY_HTML: /opt/atlassian/pipelines/agent/build/.bitbucket/pipelines/generated/pipeline/pipes/europe-west1-docker.pkg.dev/mateco-interns/pipes/wizcli/mail.html
+      - stage:
+          name: Deploy Infrastructure
+          trigger: manual
+          steps:            
+            - step:
+                name: infrastructure
+                script:
+                  - export TF_VAR_google_service_account_key=$GOOGLE_SERVICE_ACCOUNT_KEY
+                  - terraform init --backend-config="credentials=$GOOGLE_SERVICE_ACCOUNT_KEY"
+                  - terraform destroy
+                  #- terraform show
+                  #- terraform validate
+                  #- terraform apply -auto-approve
+                    
